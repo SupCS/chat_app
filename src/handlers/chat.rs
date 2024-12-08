@@ -4,9 +4,10 @@ use crate::models::message::Message as ChatMessage;
 use crate::models::user::User;
 
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
-use mongodb::bson::doc;
 use mongodb::bson::oid::ObjectId;
+use mongodb::bson::{self, doc};
 use mongodb::Database;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -82,44 +83,36 @@ pub async fn chat_handler(ws: WebSocket, clients: Arc<Clients>, db: Arc<Database
                 Ok(message) => {
                     if let Ok(text) = message.to_str() {
                         if let Ok(json_message) = serde_json::from_str::<Value>(text) {
+                            println!("Получено сообщение: {:?}", json_message); // Лог входящего сообщения
                             if let (Some(sender), Some(receiver), Some(content)) = (
                                 json_message.get("sender").and_then(|v| v.as_str()),
                                 json_message.get("receiver").and_then(|v| v.as_str()),
                                 json_message.get("content").and_then(|v| v.as_str()),
                             ) {
-                                // Перевіряємо, чи sender збігається з автентифікованим користувачем
+                                println!(
+                                    "Отправитель: {}, Получатель: {}, Содержимое: {}",
+                                    sender, receiver, content
+                                ); // Детали сообщения
+                                   // Проверка на совпадение отправителя
                                 if sender != authenticated_user {
                                     eprintln!(
-                                        "Неправильний sender: очікував {}, отримав {}",
+                                        "Ошибка: Отправитель не соответствует аутентифицированному пользователю. Ожидалось {}, получено {}",
                                         authenticated_user, sender
                                     );
                                     continue;
                                 }
-
-                                println!(
-                                    "Отримано повідомлення від {} до {}: {}",
-                                    sender, receiver, content
-                                );
-
-                                // Зберігаємо повідомлення в MongoDB
+                                println!("Сохранение сообщения в MongoDB...");
                                 let chat_message = ChatMessage::new(sender, receiver, content);
                                 let collection = db_clone.collection::<ChatMessage>("messages");
                                 if let Err(e) = save_message(&chat_message, &collection).await {
-                                    eprintln!("Помилка при збереженні повідомлення: {}", e);
+                                    eprintln!("Ошибка при сохранении сообщения в MongoDB: {}", e);
                                 }
-
-                                // Відправляємо повідомлення отримувачу
-                                clients_clone
-                                    .broadcast(format!(
-                                        "Від {} до {}: {}",
-                                        sender, receiver, content
-                                    ))
-                                    .await;
+                                println!("Сообщение успешно сохранено.");
                             } else {
-                                eprintln!("Неправильний формат повідомлення: {}", text);
+                                eprintln!("Неверный формат сообщения: {:?}", json_message);
                             }
                         } else {
-                            eprintln!("Не вдалося парсити повідомлення: {}", text);
+                            eprintln!("Не удалось разобрать JSON из текста: {}", text);
                         }
                     }
                 }
@@ -236,4 +229,112 @@ pub async fn get_chat_history_handler(
     }
 
     Ok(warp::reply::json(&messages))
+}
+
+pub async fn get_user_chats_handler(
+    token: String,
+    db: Arc<Database>,
+) -> Result<impl Reply, Rejection> {
+    // Валідація токена
+    let claims = match validate_jwt(&token) {
+        Ok(claims) => claims,
+        Err(_) => {
+            return Ok(warp::reply::json(&serde_json::json!({
+                "error": "Invalid token"
+            })));
+        }
+    };
+
+    // Отримання username автентифікованого користувача
+    let user_collection = db.collection::<User>("users");
+    let authenticated_user = match user_collection
+        .find_one(
+            doc! { "_id": ObjectId::parse_str(&claims.sub).unwrap() },
+            None,
+        )
+        .await
+    {
+        Ok(Some(user)) => user.username,
+        _ => {
+            return Ok(warp::reply::json(&serde_json::json!({
+                "error": "User not found"
+            })));
+        }
+    };
+
+    // Отримання колекції повідомлень
+    let messages_collection = db.collection::<ChatMessage>("messages");
+
+    // Пошук унікальних користувачів, з якими був обмін повідомленнями
+    let pipeline = vec![
+        doc! {
+            "$match": {
+                "$or": [
+                    { "sender": &authenticated_user },
+                    { "receiver": &authenticated_user }
+                ]
+            }
+        },
+        doc! {
+            "$group": {
+                "_id": {
+                    "$cond": [
+                        { "$eq": ["$sender", &authenticated_user] },
+                        "$receiver",
+                        "$sender"
+                    ]
+                }
+            }
+        },
+        doc! {
+            "$lookup": {
+                "from": "users",
+                "localField": "_id",
+                "foreignField": "username",
+                "as": "user_info"
+            }
+        },
+        doc! {
+            "$unwind": "$user_info"
+        },
+        doc! {
+            "$project": {
+                "username": "$_id",
+                "user_id": "$user_info._id"
+            }
+        },
+    ];
+
+    let mut cursor = match messages_collection.aggregate(pipeline, None).await {
+        Ok(cursor) => cursor,
+        Err(_) => {
+            return Ok(warp::reply::json(&serde_json::json!({
+                "error": "Failed to retrieve chat list"
+            })));
+        }
+    };
+
+    let mut chat_list = Vec::new();
+    while let Some(result) = cursor.next().await {
+        match result {
+            Ok(document) => {
+                if let Ok(chat) = bson::from_document::<ChatUser>(document) {
+                    chat_list.push(chat);
+                }
+            }
+            Err(_) => {
+                return Ok(warp::reply::json(&serde_json::json!({
+                    "error": "Error processing chat list"
+                })));
+            }
+        }
+    }
+
+    Ok(warp::reply::json(&chat_list))
+}
+
+#[derive(Serialize, Deserialize)]
+struct ChatUser {
+    user_id: ObjectId,
+    username: String,
 }

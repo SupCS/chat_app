@@ -5,10 +5,10 @@ mod models;
 
 use db::connect_to_db;
 use handlers::auth::{login_handler, register_handler};
-use handlers::chat::{chat_handler, get_chat_history_handler, Clients};
+use handlers::chat::{chat_handler, get_chat_history_handler, get_user_chats_handler, Clients};
 use mongodb::Database;
 use std::sync::Arc;
-use warp::{http::StatusCode, reject, Filter, Rejection, Reply};
+use warp::{http::Method, http::StatusCode, reject, Filter, Rejection, Reply};
 
 // Власний тип помилки
 #[derive(Debug)]
@@ -23,7 +23,6 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, std::convert::In
         return Ok(warp::reply::with_status(json, StatusCode::BAD_REQUEST));
     }
 
-    // Інші помилки
     let json = warp::reply::json(&serde_json::json!({ "error": "Unhandled error" }));
     Ok(warp::reply::with_status(
         json,
@@ -40,7 +39,14 @@ async fn main() {
     let db = Arc::new(connect_to_db().await.expect("Failed to connect to DB"));
     let clients = Arc::new(Clients::new());
 
-    // Маршрут для реєстрації
+    // Налаштування CORS
+    let cors = warp::cors()
+        .allow_any_origin()
+        .allow_methods(vec![Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers(vec!["Content-Type", "Authorization"])
+        .build();
+
+    // Маршрути
     let register = warp::path!("register")
         .and(warp::post())
         .and(warp::body::json())
@@ -50,7 +56,6 @@ async fn main() {
         }))
         .and_then(register_handler);
 
-    // Маршрут для логіну
     let login = warp::path!("login")
         .and(warp::post())
         .and(warp::body::json())
@@ -60,7 +65,6 @@ async fn main() {
         }))
         .and_then(login_handler);
 
-    // Маршрут для WebSocket чату
     let chat = warp::path!("chat")
         .and(warp::ws())
         .and(warp::query::<std::collections::HashMap<String, String>>())
@@ -91,6 +95,15 @@ async fn main() {
             },
         );
 
+    let chat_list = warp::path!("chats")
+        .and(warp::get())
+        .and(warp::header::<String>("Authorization"))
+        .and(warp::any().map({
+            let db = db.clone();
+            move || db.clone()
+        }))
+        .and_then(get_user_chats_handler);
+
     let chat_history = warp::path!("history")
         .and(warp::get())
         .and(warp::query::<std::collections::HashMap<String, String>>())
@@ -101,11 +114,14 @@ async fn main() {
         }))
         .and_then(get_chat_history_handler);
 
+    // Об'єднання маршрутів із застосуванням CORS
     let routes = register
         .or(login)
         .or(chat)
         .or(chat_history)
-        .recover(handle_rejection);
+        .or(chat_list)
+        .recover(handle_rejection)
+        .with(cors);
 
     // Запуск сервера
     warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
