@@ -6,10 +6,10 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::env;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Claims {
-    sub: String,
-    exp: usize,
+    pub sub: String,
+    pub exp: usize,
 }
 
 pub fn hash_password(password: &str) -> String {
@@ -44,12 +44,39 @@ pub fn generate_jwt(user_id: &str) -> String {
 }
 
 pub fn validate_jwt(token: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
-    let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    // Розділення токена, якщо він містить "Bearer "
+    let token = token.strip_prefix("Bearer ").unwrap_or(token);
+
+    println!("Валідація токена: {}", token);
+
+    let secret = match env::var("JWT_SECRET") {
+        Ok(secret) => {
+            println!("Знайдений секретний ключ: {}", secret);
+            secret
+        }
+        Err(_) => {
+            println!("Секретний ключ не знайдений у змінних оточення");
+            return Err(jsonwebtoken::errors::Error::from(
+                jsonwebtoken::errors::ErrorKind::MissingRequiredClaim("JWT_SECRET".to_string()),
+            ));
+        }
+    };
+
     let validation = Validation::default();
-    let token_data = decode::<Claims>(
+
+    // Спроба розпарсити токен
+    match decode::<Claims>(
         token,
         &DecodingKey::from_secret(secret.as_ref()),
         &validation,
-    )?;
-    Ok(token_data.claims)
+    ) {
+        Ok(token_data) => {
+            println!("Успішно валідовано токен: {:?}", token_data.claims);
+            Ok(token_data.claims)
+        }
+        Err(e) => {
+            println!("Помилка валідації токена: {:?}", e);
+            Err(e)
+        }
+    }
 }

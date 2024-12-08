@@ -77,9 +77,12 @@ async fn main() {
              query: std::collections::HashMap<String, String>,
              clients: Arc<Clients>,
              db: Arc<Database>| async move {
-                if let Some(token) = query.get("token") {
-                    match crate::auth::validate_jwt(token) {
-                        Ok(_) => Ok(ws.on_upgrade(move |socket| chat_handler(socket, clients, db))),
+                if let Some(token) = query.get("token").cloned() {
+                    match crate::auth::validate_jwt(&token) {
+                        Ok(_) => {
+                            Ok(ws
+                                .on_upgrade(move |socket| chat_handler(socket, clients, db, token)))
+                        }
                         Err(_) => Err(reject::custom(CustomError("Invalid token".into()))),
                     }
                 } else {
@@ -90,6 +93,8 @@ async fn main() {
 
     let chat_history = warp::path!("history")
         .and(warp::get())
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(warp::header::<String>("Authorization"))
         .and(warp::any().map({
             let db = db.clone();
             move || db.clone()
