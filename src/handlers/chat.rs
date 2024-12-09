@@ -42,11 +42,14 @@ impl Clients {
 // Обробник WebSocket-з'єднання
 pub async fn chat_handler(ws: WebSocket, clients: Arc<Clients>, db: Arc<Database>, token: String) {
     let (mut ws_tx, mut ws_rx) = ws.split();
-
     let (client_tx, mut client_rx) = mpsc::unbounded_channel();
 
     // Додаємо нового клієнта
-    clients.senders.lock().await.push(client_tx);
+    clients.senders.lock().await.push(client_tx.clone());
+    println!(
+        "Новий клієнт підключився. Всього клієнтів: {}",
+        clients.senders.lock().await.len()
+    );
 
     let clients_clone = clients.clone();
     let db_clone = db.clone();
@@ -60,7 +63,7 @@ pub async fn chat_handler(ws: WebSocket, clients: Arc<Clients>, db: Arc<Database
         }
     };
 
-    let authenticated_user_id = claims.sub; // ObjectId з токена
+    let authenticated_user_id = claims.sub;
 
     // Отримуємо username користувача
     let collection = db.collection::<User>("users");
@@ -73,69 +76,65 @@ pub async fn chat_handler(ws: WebSocket, clients: Arc<Clients>, db: Arc<Database
     {
         Ok(Some(user)) => user.username,
         _ => {
-            eprintln!("Користувач не знайдений");
+            eprintln!("Користувач з ID {} не знайдений", authenticated_user_id);
             return;
         }
     };
 
+    println!("Користувач авторизований: {}", authenticated_user);
+
+    // Обробка вхідних повідомлень від WebSocket
     tokio::spawn(async move {
         while let Some(result) = ws_rx.next().await {
             match result {
                 Ok(message) => {
                     if let Ok(text) = message.to_str() {
+                        println!("Отримано повідомлення: {}", text);
+
                         if let Ok(json_message) = serde_json::from_str::<Value>(text) {
-                            println!("Получено сообщение: {:?}", json_message); // Лог входящего сообщения
                             if let (Some(sender), Some(receiver), Some(content)) = (
                                 json_message.get("sender").and_then(|v| v.as_str()),
                                 json_message.get("receiver").and_then(|v| v.as_str()),
                                 json_message.get("content").and_then(|v| v.as_str()),
                             ) {
-                                println!(
-                                    "Відправник: {}, Отримувач: {}, Зміст: {}",
-                                    sender, receiver, content
-                                ); // Детали сообщения
-                                   // Проверка на совпадение отправителя
                                 if sender != authenticated_user {
                                     eprintln!(
-                                        "Ошибка: Отправитель не соответствует аутентифицированному пользователю. Ожидалось {}, получено {}",
-                                        authenticated_user, sender
+                                        "Помилка: Відправник {} не відповідає авторизованому користувачу {}",
+                                        sender, authenticated_user
                                     );
                                     continue;
                                 }
 
-                                let users_collection = db_clone.collection::<User>("users");
-                                let receiver_user_result = users_collection
-                                    .find_one(doc! { "username": receiver }, None)
-                                    .await;
+                                println!(
+                                    "Відправник: {}, Отримувач: {}, Зміст: {}",
+                                    sender, receiver, content
+                                );
 
-                                match receiver_user_result {
-                                    Ok(Some(_)) => {
-                                        println!("Користувач '{}' знайдений.", receiver);
-                                    }
-                                    Ok(None) => {
-                                        eprintln!(
-                                            "Помилка: Користувач з ім'ям '{}' не знайдений",
-                                            receiver
-                                        );
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Помилка при перевірці отримувача: {}", e);
-                                        continue;
-                                    }
-                                }
-                                println!("Сохранение сообщения в MongoDB...");
+                                // Зберігаємо повідомлення в MongoDB
                                 let chat_message = ChatMessage::new(sender, receiver, content);
-                                let collection = db_clone.collection::<ChatMessage>("messages");
-                                if let Err(e) = save_message(&chat_message, &collection).await {
-                                    eprintln!("Ошибка при сохранении сообщения в MongoDB: {}", e);
+                                if let Err(e) =
+                                    save_message(&chat_message, &db_clone.collection("messages"))
+                                        .await
+                                {
+                                    eprintln!("Помилка збереження повідомлення: {}", e);
+                                    continue;
                                 }
-                                println!("Сообщение успешно сохранено.");
+
+                                println!("Повідомлення збережено у базі даних.");
+
+                                // Трансляція повідомлення всім клієнтам
+                                if let Ok(serialized_message) = serde_json::to_string(&chat_message)
+                                {
+                                    clients_clone.broadcast(serialized_message).await;
+                                    println!("Повідомлення транслюється клієнтам.");
+                                } else {
+                                    eprintln!("Помилка серіалізації повідомлення.");
+                                }
                             } else {
-                                eprintln!("Неверный формат сообщения: {:?}", json_message);
+                                eprintln!("Невірний формат повідомлення: {:?}", json_message);
                             }
                         } else {
-                            eprintln!("Не удалось разобрать JSON из текста: {}", text);
+                            eprintln!("Не вдалося розібрати повідомлення: {}", text);
                         }
                     }
                 }
@@ -145,10 +144,17 @@ pub async fn chat_handler(ws: WebSocket, clients: Arc<Clients>, db: Arc<Database
                 }
             }
         }
+
+        println!(
+            "WebSocket-з'єднання закрите для користувача: {}",
+            authenticated_user
+        );
     });
 
+    // Обробка відправки повідомлень до WebSocket клієнта
     tokio::spawn(async move {
         while let Some(message) = client_rx.recv().await {
+            println!("Відправка повідомлення клієнту: {:?}", message);
             if let Err(e) = ws_tx.send(message).await {
                 eprintln!("Помилка при відправці повідомлення: {}", e);
                 break;
