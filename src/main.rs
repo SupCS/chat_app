@@ -114,12 +114,22 @@ async fn main() {
         }))
         .and_then(get_chat_history_handler);
 
+    let check_user = warp::path!("users" / "check")
+        .and(warp::get())
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(warp::any().map({
+            let db = db.clone();
+            move || db.clone()
+        }))
+        .and_then(handlers::chat::check_user_handler);
+
     // Об'єднання маршрутів із застосуванням CORS
     let routes = register
         .or(login)
         .or(chat)
         .or(chat_history)
         .or(chat_list)
+        .or(check_user)
         .recover(handle_rejection)
         .with(cors);
 

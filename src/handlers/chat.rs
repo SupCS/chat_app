@@ -2,6 +2,7 @@ use crate::auth::validate_jwt;
 use crate::db::message::{get_all_messages, save_message};
 use crate::models::message::Message as ChatMessage;
 use crate::models::user::User;
+use crate::CustomError;
 
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use mongodb::bson::oid::ObjectId;
@@ -90,7 +91,7 @@ pub async fn chat_handler(ws: WebSocket, clients: Arc<Clients>, db: Arc<Database
                                 json_message.get("content").and_then(|v| v.as_str()),
                             ) {
                                 println!(
-                                    "Отправитель: {}, Получатель: {}, Содержимое: {}",
+                                    "Відправник: {}, Отримувач: {}, Зміст: {}",
                                     sender, receiver, content
                                 ); // Детали сообщения
                                    // Проверка на совпадение отправителя
@@ -100,6 +101,28 @@ pub async fn chat_handler(ws: WebSocket, clients: Arc<Clients>, db: Arc<Database
                                         authenticated_user, sender
                                     );
                                     continue;
+                                }
+
+                                let users_collection = db_clone.collection::<User>("users");
+                                let receiver_user_result = users_collection
+                                    .find_one(doc! { "username": receiver }, None)
+                                    .await;
+
+                                match receiver_user_result {
+                                    Ok(Some(_)) => {
+                                        println!("Користувач '{}' знайдений.", receiver);
+                                    }
+                                    Ok(None) => {
+                                        eprintln!(
+                                            "Помилка: Користувач з ім'ям '{}' не знайдений",
+                                            receiver
+                                        );
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Помилка при перевірці отримувача: {}", e);
+                                        continue;
+                                    }
                                 }
                                 println!("Сохранение сообщения в MongoDB...");
                                 let chat_message = ChatMessage::new(sender, receiver, content);
@@ -337,4 +360,29 @@ pub async fn get_user_chats_handler(
 struct ChatUser {
     user_id: ObjectId,
     username: String,
+}
+
+pub async fn check_user_handler(
+    query_params: std::collections::HashMap<String, String>,
+    db: Arc<Database>,
+) -> Result<impl Reply, Rejection> {
+    if let Some(username) = query_params.get("username") {
+        let collection = db.collection::<User>("users");
+
+        match collection
+            .find_one(doc! { "username": username }, None)
+            .await
+        {
+            Ok(Some(_)) => Ok(warp::reply::json(&serde_json::json!({ "exists": true }))),
+            Ok(None) => Ok(warp::reply::json(&serde_json::json!({ "exists": false }))),
+            Err(e) => {
+                eprintln!("Помилка при перевірці користувача: {}", e);
+                Err(warp::reject::custom(CustomError("Database error".into())))
+            }
+        }
+    } else {
+        Ok(warp::reply::json(&serde_json::json!({
+            "error": "Username is required"
+        })))
+    }
 }
